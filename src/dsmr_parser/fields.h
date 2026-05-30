@@ -2,7 +2,10 @@
 
 #include "parser.h"
 #include "util.h"
+#include <algorithm>
 #include <optional>
+#include <ranges>
+#include <string>
 #include <string_view>
 
 #ifndef DSMR_GAS_MBUS_ID
@@ -21,7 +24,7 @@
 namespace dsmr_parser {
 
 template <typename T>
-struct ParsedField {
+struct ParsedField : NonCopyableAndNonMovable {
   template <typename F>
   void apply(F& f) {
     f.apply(*static_cast<T*>(this));
@@ -38,6 +41,45 @@ struct StringField : ParsedField<T> {
       static_cast<T*>(this)->val() = sv;
     return res;
   }
+};
+
+// Uses heuristics to detect if a string is hex-encoded or not.
+template <typename T, size_t minlen, size_t maxlen>
+struct HexStringOrRegularStringField : ParsedField<T> {
+  std::optional<std::string_view> parse(std::string_view input) {
+    std::string_view sv;
+    auto res = parse_string(sv, minlen, maxlen, input);
+    if (!res)
+      return std::nullopt;
+
+    static_cast<T*>(this)->val() = sv;
+
+    auto is_hex_digit = [](char ch) { return (ch >= '0' && ch <= '9') || (ch >= 'A' && ch <= 'F'); };
+    auto is_alnum = [](char ch) { return (ch >= '0' && ch <= '9') || (ch >= 'A' && ch <= 'Z'); };
+
+    // Only an even number of uppercase hex digits can be a hex coded string.
+    if ((sv.length() & 1) || !std::ranges::all_of(sv, is_hex_digit))
+      return res;
+
+    auto value = [](char ch) { return ch <= '9' ? ch - '0' : ch - 'A' + 10; };
+
+    hexStr.clear();
+    hexStr.reserve(sv.length() / 2);
+    for (size_t i = 0; i < sv.length(); i += 2) {
+      const auto ch = static_cast<char>((value(sv[i]) << 4) + value(sv[i + 1]));
+      if (!is_alnum(ch)) {
+        // Decoded byte is not a digit or uppercase letter.
+        hexStr.clear();
+        return res;
+      }
+      hexStr.push_back(ch);
+    }
+    static_cast<T*>(this)->val() = std::string_view(hexStr);
+    return res;
+  }
+
+private:
+  std::string hexStr;
 };
 
 // A timestamp is essentially a string using YYMMDDhhmmssX format (where
@@ -241,7 +283,7 @@ DEFINE_FIELD(p1_version_be, std::string_view, ObisId(0, 0, 96, 1, 4), StringFiel
 DEFINE_FIELD(timestamp, std::string_view, ObisId(0, 0, 1, 0, 0), TimestampField);
 
 // Equipment identifier
-DEFINE_FIELD(equipment_id, std::string_view, ObisId(0, 0, 96, 1, 1), StringField, 0, 96);
+DEFINE_FIELD(equipment_id, std::string_view, ObisId(0, 0, 96, 1, 1), HexStringOrRegularStringField, 0, 96);
 
 // Meter Reading electricity delivered to client (Special for Lux) in 0,001 kWh
 // TODO: by OBIS 1-0:1.8.0.255 IEC 62056 it should be Positive active energy (A+) total [kWh], should we rename it?
@@ -482,9 +524,9 @@ DEFINE_FIELD(active_demand_abs, FixedValue, ObisId(1, 0, 15, 24, 0), FixedField,
 DEFINE_FIELD(gas_device_type, uint16_t, ObisId(0, DSMR_GAS_MBUS_ID, 24, 1, 0), IntField, units::none);
 
 // Equipment identifier (Gas)
-DEFINE_FIELD(gas_equipment_id, std::string_view, ObisId(0, DSMR_GAS_MBUS_ID, 96, 1, 0), StringField, 0, 96);
+DEFINE_FIELD(gas_equipment_id, std::string_view, ObisId(0, DSMR_GAS_MBUS_ID, 96, 1, 0), HexStringOrRegularStringField, 0, 96);
 // Equipment identifier (Gas) BE
-DEFINE_FIELD(gas_equipment_id_be, std::string_view, ObisId(0, DSMR_GAS_MBUS_ID, 96, 1, 1), StringField, 0, 96);
+DEFINE_FIELD(gas_equipment_id_be, std::string_view, ObisId(0, DSMR_GAS_MBUS_ID, 96, 1, 1), HexStringOrRegularStringField, 0, 96);
 
 // Valve position Gas (on/off/released) (Note: Removed in 4.0.7 / 4.2.2 / 5.0).
 DEFINE_FIELD(gas_valve_position, uint8_t, ObisId(0, DSMR_GAS_MBUS_ID, 24, 4, 0), IntField, units::none);
@@ -502,7 +544,7 @@ DEFINE_FIELD(gas_delivered_text, std::string_view, ObisId(0, DSMR_GAS_MBUS_ID, 2
 DEFINE_FIELD(thermal_device_type, uint16_t, ObisId(0, DSMR_THERMAL_MBUS_ID, 24, 1, 0), IntField, units::none);
 
 // Equipment identifier (Thermal: heat or cold)
-DEFINE_FIELD(thermal_equipment_id, std::string_view, ObisId(0, DSMR_THERMAL_MBUS_ID, 96, 1, 0), StringField, 0, 96);
+DEFINE_FIELD(thermal_equipment_id, std::string_view, ObisId(0, DSMR_THERMAL_MBUS_ID, 96, 1, 0), HexStringOrRegularStringField, 0, 96);
 
 // Valve position (on/off/released) (Note: Removed in 4.0.7 / 4.2.2 / 5.0).
 DEFINE_FIELD(thermal_valve_position, uint8_t, ObisId(0, DSMR_THERMAL_MBUS_ID, 24, 4, 0), IntField, units::none);
@@ -515,7 +557,7 @@ DEFINE_FIELD(thermal_delivered, TimestampedFixedValue, ObisId(0, DSMR_THERMAL_MB
 DEFINE_FIELD(water_device_type, uint16_t, ObisId(0, DSMR_WATER_MBUS_ID, 24, 1, 0), IntField, units::none);
 
 // Equipment identifier (Thermal: heat or cold)
-DEFINE_FIELD(water_equipment_id, std::string_view, ObisId(0, DSMR_WATER_MBUS_ID, 96, 1, 0), StringField, 0, 96);
+DEFINE_FIELD(water_equipment_id, std::string_view, ObisId(0, DSMR_WATER_MBUS_ID, 96, 1, 0), HexStringOrRegularStringField, 0, 96);
 
 // Valve position (on/off/released) (Note: Removed in 4.0.7 / 4.2.2 / 5.0).
 DEFINE_FIELD(water_valve_position, uint8_t, ObisId(0, DSMR_WATER_MBUS_ID, 24, 4, 0), IntField, units::none);
@@ -528,7 +570,7 @@ DEFINE_FIELD(water_delivered, TimestampedFixedValue, ObisId(0, DSMR_WATER_MBUS_I
 DEFINE_FIELD(sub_device_type, uint16_t, ObisId(0, DSMR_SUB_MBUS_ID, 24, 1, 0), IntField, units::none);
 
 // Equipment identifier (Thermal: heat or cold)
-DEFINE_FIELD(sub_equipment_id, std::string_view, ObisId(0, DSMR_SUB_MBUS_ID, 96, 1, 0), StringField, 0, 96);
+DEFINE_FIELD(sub_equipment_id, std::string_view, ObisId(0, DSMR_SUB_MBUS_ID, 96, 1, 0), HexStringOrRegularStringField, 0, 96);
 
 // Valve position (on/off/released) (Note: Removed in 4.0.7 / 4.2.2 / 5.0).
 DEFINE_FIELD(sub_valve_position, uint8_t, ObisId(0, DSMR_SUB_MBUS_ID, 24, 4, 0), IntField, units::none);
